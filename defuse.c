@@ -602,10 +602,9 @@ static struct fuse_operations fs_oper;
 
 int main(int argc, char **argv) {
 	char *user=getenv("DESPOT_USER");
-	printf("%s\n", user);
-	return 2;
 	if(!user) {
 		fprintf(stderr, "gimme an user !\n");
+		return -1;
 	}
 	char *pass=getenv("DESPOT_PASS");
 
