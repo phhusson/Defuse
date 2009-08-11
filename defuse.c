@@ -1,6 +1,7 @@
 /*
- * Build with gcc 
+ * Build with :
  * gcc libspotify-gw.c -o libspotify-gw -ldb -Wall -g `pkg-config fuse --cflags --libs` ezxml.c
+ * Use with a despotify gateway running on localhost:1234
  */
 #define _GNU_SOURCE
 #define FUSE_USE_VERSION 26
