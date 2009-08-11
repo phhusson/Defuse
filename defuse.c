@@ -181,8 +181,9 @@ int get_answer2(char *buf, int ln) {
 		ret=read(fd, buf+tot, tot2-tot);
 		tot+=ret;
 	}
+	printf("tot2=%d\n", tot2);
 	assert(tot==tot2);
-	return tot;
+	return tot2;
 }
 
 void fill_track(const char *id, int force) {
@@ -297,7 +298,7 @@ char *get_song_name(SONG sg) {
 }
 
 int get_substream(SONG *sg, long long int offset, int length, char *buf) {
-	ezxml_t file=ezxml_get(sg->tree, "tracks", 0, "track", 0, "files", 0, "file", 0/*1 for 320kbps, broken ATM because of file size*/, "");
+	ezxml_t file=ezxml_get(sg->tree, "tracks", 0, "track", 0, "files", 0, "file", 1, "");
 	//Assume 320kbps are in second row (proven right until now)
 	//TODO: do it a better way
 	if(!file)
@@ -309,11 +310,11 @@ int get_substream(SONG *sg, long long int offset, int length, char *buf) {
 	if(sg->key[0]==0) {
 		char *key=get_key(sg->pl_id, fileid);
 		strncpy(sg->key, key, 33);
+		free(key);
 		sg->key[32]=0;
 	}
-	int r=0;
 	char *cmd;
-	asprintf(&cmd, "substream %s %d %d %s\n", fileid, offset, length, sg->key);
+	asprintf(&cmd, "substream %s %lld %d %s\n", fileid, offset, length, sg->key);
 	write2(fd, cmd);
 	free(cmd);
 	int ret=get_answer2(buf, length);
@@ -327,7 +328,13 @@ int get_substream(SONG *sg, long long int offset, int length, char *buf) {
 }
 
 long long int get_song_length(SONG sg) {
-	int approx=160000/(8*1000)*atoi(ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "length", -1)));
+	ezxml_t file2=ezxml_get(sg.tree, "tracks", 0, "track", 0, "files", 0,"file", 1, "");
+	int approx;
+	if(file2)
+		approx=320000/(8*1000)*atoi(ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "length", -1)));
+	else
+		approx=160000/(8*1000)*atoi(ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "length", -1)));
+	//Here's a better way to do it, but wwwaaaaaaaayyyyyyy slower.
 	//Maybe BUF_SZ doesn't really fits the role
 	/*
 	int start=approx-BUF_SZ/2;
