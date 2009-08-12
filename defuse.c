@@ -1,10 +1,14 @@
 /*
  * Build with :
- * gcc libspotify-gw.c -o libspotify-gw -ldb -Wall -g `pkg-config fuse --cflags --libs` ezxml.c
+ * gcc defuse.c -o defuse -ldb -Wall -g `pkg-config fuse --cflags --libs` ezxml.c
  * Use with a despotify gateway running on localhost:1234
+ * Search for the SETTING string to know what's tunnable
+ * Please note that this works only single threaded, so add -s flag when running.
  */
 #define _GNU_SOURCE
 #define FUSE_USE_VERSION 26
+//SETTING:Uncomment this to drop asserts and log messages
+//#define NDEBUG
 #include <fuse.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +24,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <assert.h>
+#include <pthread.h>
 #include "ezxml.h"
 
 void write2(int fd, const char *str) {
@@ -31,12 +36,15 @@ void write2(int fd, const char *str) {
 
 static int fd;
 
+//Warning: The id/key's sizes are currently fixed
+//but despotify's documentation says it may change.
 typedef struct {
 	char *name;
 	char id[35];
 } PL;
 
 PL *pls;
+pthread_mutex_t pls_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
 	char *name;
@@ -49,81 +57,14 @@ typedef struct {
 } SONG;
 SONG *sgs;
 int sg_pos;
+pthread_mutex_t sgs = PTHREAD_MUTEX_INITIALIZER;
 
+//SETTING
+//Force to use only 160kbps files
+//(may not work, see get_substream)
+static int only_160=0;
 
-int init(const char *host, const char *port, const char *user, const char *pass) {
-	pls=NULL;sgs=NULL;
-	if(!user || !pass) {
-		fprintf(stderr, "Won't login without login/pass\n");
-		return -1;
-	}
-	{ 
-		mkdir(CACHE_PATH, 0777);
-		mkdir(CACHE_PATH"/songs", 0777);
-		mkdir(CACHE_PATH"/playlists", 0777);
-		mkdir(CACHE_PATH"/files", 0777);
-		errno=0;//I'm lazy today. Will clean later (TODO)
-		if(!host)
-			host="localhost";
-		if(!port)
-			port="1234";
-
-		int err;
-		struct addrinfo hints, *res0, *res;
-
-
-		//hints is a structure like the result, but with some undefined values,
-		//defined ones wouldn't be remplaced
-		memset(&hints, 0, sizeof(hints));
-		hints.ai_family = PF_UNSPEC;  
-		hints.ai_socktype = SOCK_STREAM;
-
-
-		/* Obtain AAAA and A record using getaddrinfo*/
-		err = getaddrinfo(host, port, &hints, &res0);
-
-		if (err) {
-			fprintf(stderr, "error : %s", gai_strerror(err));
-			freeaddrinfo(res0);
-			return -1;
-		}
-
-
-		/* Use the result of getaddrinfo, and try every result until connection is established */
-		for (res = res0; res; res = res->ai_next) {  
-			fd = socket (res->ai_family, res->ai_socktype, res->ai_protocol);  
-			if (fd < 0)  
-				continue;  
-			if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {  
-				close (fd);  
-				continue;
-			}
-			break;
-		}
-		freeaddrinfo(res0);
-	}
-
-	char buffer[BUF_SZ];
-	char *cmd=NULL;
-	int ret;
-
-	asprintf(&cmd, "login %s %s\n", user, pass);
-	write2(fd, cmd);
-	free(cmd);
-
-	bzero(buffer, BUF_SZ);
-	read(fd, buffer, BUF_SZ);
-	sscanf(buffer, "%d", &ret);
-
-	if(ret!=200) {
-		fprintf(stderr, "Failed to login: ");
-		write(2, buffer, BUF_SZ);
-		fprintf(stderr, "\n");
-		return -1;
-	}
-	return 0;
-}
-
+//General communication protocol with despotify gateway
 char *get_answer(int *ln) {
 	char *buffer=malloc(BUF_SZ);
 	int ret,tot,tot2;
@@ -186,6 +127,75 @@ int get_answer2(char *buf, int ln) {
 	return tot2;
 }
 
+//Create connection and login
+int init(const char *host, const char *port, const char *user, const char *pass) {
+	pls=NULL;sgs=NULL;
+	if(!user || !pass) {
+		fprintf(stderr, "Won't login without login/pass\n");
+		return -1;
+	}
+	{ 
+		mkdir(CACHE_PATH, 0777);
+		mkdir(CACHE_PATH"/songs", 0777);
+		mkdir(CACHE_PATH"/playlists", 0777);
+		mkdir(CACHE_PATH"/files", 0777);
+		errno=0;//I'm lazy today. Will clean later (TODO)
+		if(!host)
+			host="localhost";
+		if(!port)
+			port="1234";
+
+		int err;
+		struct addrinfo hints, *res0, *res;
+
+
+		//hints is a structure like the result, but with some undefined values,
+		//defined ones wouldn't be remplaced
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = PF_UNSPEC;  
+		hints.ai_socktype = SOCK_STREAM;
+
+
+		/* Obtain AAAA and A record using getaddrinfo*/
+		err = getaddrinfo(host, port, &hints, &res0);
+
+		if (err) {
+			fprintf(stderr, "error : %s", gai_strerror(err));
+			freeaddrinfo(res0);
+			return -1;
+		}
+
+
+		/* Use the result of getaddrinfo, and try every result until connection is established */
+		for (res = res0; res; res = res->ai_next) {  
+			fd = socket (res->ai_family, res->ai_socktype, res->ai_protocol);  
+			if (fd < 0)  
+				continue;  
+			if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {  
+				close (fd);  
+				continue;
+			}
+			break;
+		}
+		freeaddrinfo(res0);
+	}
+
+	char *cmd=NULL;
+
+	asprintf(&cmd, "login %s %s\n", user, pass);
+	write2(fd, cmd);
+	free(cmd);
+
+	int ln;
+	free(get_answer(&ln));
+	assert(ln==0);
+	return 0;
+}
+
+//Download xml description file of the track
+//the force flag will redownload it even if it has already been donwloaded
+//Should be useless most time,
+//But still you should do some rm -Rf CACHE_PATH/songs/ for the 320kbps migration
 void fill_track(const char *id, int force) {
 	char *filename;
 	int r;
@@ -211,6 +221,11 @@ void fill_track(const char *id, int force) {
 	free(filename);
 }
 
+//Download xml description file of the playlist
+//Mainly contains song ids and playlist name
+//Also for 0^34 ("playlist" of playlists)
+//You should force update at every update of the playlist...
+//For little playlists you can force it everytime, but for big ones you'd better not
 void fill_pl(const char *id, int force) {
 	char *filename;
 	int r;
@@ -236,7 +251,13 @@ void fill_pl(const char *id, int force) {
 	free(filename);
 }
 
+//Return an ezxml tree of the playlist
 ezxml_t get_pl(const char *id) {
+	//SETTING:
+	//If you use little playlists (<30), you could set 1 here (force flag of fill_pl)
+	//This will get you realtime (meaning at every restart of defuse), playlist update
+	//But for big playlists, this may be wwwaaaaayyyyyy too slow
+	//(sometimes my 300+ playlist takes more than GW timeout...)
 	fill_pl(id, 0);
 	char *filename;
 	asprintf(&filename, CACHE_PATH "/playlists/%s.xml", id);
@@ -245,7 +266,11 @@ ezxml_t get_pl(const char *id) {
 	return tree;
 }
 
+//Return an ezxml tree of the song
 ezxml_t get_track(const char *id) {
+	//SETTING:
+	//You may set 1 here (force flag of fill_track), so you won't have any delay with the 320kbps migration
+	//But sometimes this takes a lot of time (or 500 GW error)
 	fill_track(id, 0);
 	char *filename;
 	asprintf(&filename, CACHE_PATH "/songs/%s.xml", id);
@@ -254,6 +279,7 @@ ezxml_t get_track(const char *id) {
 	return tree;
 }
 
+//Return the key for a song/file pair
 char *get_key(char *sg_id, char *fileid) {
 	char *cmd;
 	asprintf(&cmd, "key %s %s\n", fileid, sg_id);
@@ -261,7 +287,9 @@ char *get_key(char *sg_id, char *fileid) {
 	free(cmd);
 	int ln=0;
 	char *answer=get_answer(&ln);
+#ifndef NDEBUG
 	fprintf(stderr, "Got key !\n");
+#endif
 	char *ret;
 
 	{
@@ -270,25 +298,35 @@ char *get_key(char *sg_id, char *fileid) {
 			if(answer[i]==0)
 				answer[i]=' ';
 	}
-	printf("ln=%d\n", ln);
+#ifndef NDEBUG
+	fprintf(stderr, "ln=%d\n", ln);
 	write(2, answer, ln);
+#endif
 	ezxml_t tree=ezxml_parse_str(answer, ln);
 	ezxml_t key=ezxml_get(tree, "key", -1);
 	ret=strdup(ezxml_txt(key));
 	ezxml_free(tree);
 	free(answer);
+#ifndef NDEBUG
 	fprintf(stderr, "Key is %s!\n", ret);
+#endif
 	return ret;
 }
 
+//Explicit
 char *get_playlist_name(const char *id) {
 	ezxml_t tree=get_pl(id);
+	//The XML Tree isn't explicit at all...
+	//Look at CACHE_PATH/playlists/*.xml
 	char *ret=strdup(ezxml_txt(ezxml_get(tree, "next-change", 0, "change", 0, "ops", 0, "name", -1)));
 	ezxml_free(tree);
 	return ret;
 }
 
 char *get_song_name(SONG sg) {
+	//SETTING
+	//Change here if you want the files to have
+	//names other than "artist - album - title.ogg"
 	char *artist=ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "artist", -1));
 	char *title=ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "title", -1));
 	char *album=ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "album", -1));
@@ -298,31 +336,46 @@ char *get_song_name(SONG sg) {
 }
 
 int get_substream(SONG *sg, long long int offset, int length, char *buf) {
-	ezxml_t file=ezxml_get(sg->tree, "tracks", 0, "track", 0, "files", 0, "file", 1, "");
+	//TODO Cache !
+	//But needs sparse files, and can't find any easy way to do it
+	ezxml_t file=ezxml_get(sg->tree, "tracks", 0, "track", 0, "files", 0, "file", !only_160, "");
 	//Assume 320kbps are in second row (proven right until now)
-	//TODO: do it a better way
+	//TODO: do it a better way, but needs string parsing (with a string i don't totally understand...)
 	if(!file)
 		file=ezxml_get(sg->tree, "tracks", 0, "track", 0, "files", 0, "file", 0, "");
+	assert(file);
 	char fileid[41];
 	strncpy(fileid, ezxml_attr(file, "id"), 41);
 	fileid[40]=0;
 
+	//Caching fileid key
+	//TODO: Is the key constant for a file ?
+	//Else we will have to manage that problem (only one global key which will be destroyed at every file change?)
 	if(sg->key[0]==0) {
 		char *key=get_key(sg->pl_id, fileid);
 		strncpy(sg->key, key, 33);
 		free(key);
 		sg->key[32]=0;
 	}
+
 	char *cmd;
 	asprintf(&cmd, "substream %s %lld %d %s\n", fileid, offset, length, sg->key);
 	write2(fd, cmd);
 	free(cmd);
 	int ret=get_answer2(buf, length);
 	if(offset==0) {
+		//Please note that this 167 hack is needed but still not undertstood:
+		//There is some Ogg-alike garbage at the start of the stream
+		if(ret<=167)
+			//Couldn't get anything useful...
+			//Happens sometime, still don't know why.
+			return 0;
 		ret-=167;
 		memmove(buf, buf+167, ret);
 		return ret;
 	} else {
+		//Should we do a 167 here too ?
+		//Not so sure, but it seems to works right (but with a little glitch)
 		return ret;
 	}
 }
@@ -330,7 +383,7 @@ int get_substream(SONG *sg, long long int offset, int length, char *buf) {
 long long int get_song_length(SONG sg) {
 	ezxml_t file2=ezxml_get(sg.tree, "tracks", 0, "track", 0, "files", 0,"file", 1, "");
 	int approx;
-	if(file2)
+	if(file2 && !only_160)
 		approx=320000/(8*1000)*atoi(ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "length", -1)));
 	else
 		approx=160000/(8*1000)*atoi(ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "length", -1)));
@@ -346,6 +399,7 @@ long long int get_song_length(SONG sg) {
 
 
 void clear_pls() {
+	pthread_mutex_lock(&pls_mutex);
 	unsigned int i;
 	if(!pls)
 		return;
@@ -355,9 +409,11 @@ void clear_pls() {
 	}
 	free(pls);
 	pls=NULL;
+	pthread_mutex_unlock(&pls_mutex);
 }
 
 void Check_cache() {
+	pthread_mutex_lock(&pls_mutex);
 	if(pls==NULL) {
 		ezxml_t tree=get_pl("0000000000000000000000000000000000");
 		char *items=ezxml_txt(ezxml_get(tree, "next-change", 0, "change", 0, "ops", 0, "add", 0, "items", -1));
@@ -392,6 +448,7 @@ void Check_cache() {
 		pls[pls_pos].name=NULL;
 		ezxml_free(tree);
 	}
+	pthread_mutex_unlock(&pls_mutex);
 }
 char **get_playlists() {
 	Check_cache();
@@ -419,10 +476,12 @@ void fillin_sgs(char *plid) {
 	if(sgs)
 		for(j=0;sgs[j].name;++j)
 			if(strncmp(sgs[j].pl_id, plid, 34)==0) {
+				//Found one song in our playlist, assume it has been filled.
 				ezxml_free(tree);
 				return;
 			}
 	while(items && items[0]) {
+		//TODO:Maybe move to some cleaner code (with std::vector or something like this)
 		sgs=realloc(sgs, (sg_pos+2)*sizeof(SONG));
 		while(!isxdigit(items[0]))
 			items++;
@@ -436,7 +495,7 @@ void fillin_sgs(char *plid) {
 		cur.key[0]=0;
 		cur.tree=sg_tree;
 		cur.size=get_song_length(cur);
-		cur.end=1000*1000*1000;//A song of 1GB should be fair.
+		cur.end=1000*1000*1000;//A song of 1GB should be fair enough.
 		{
 			char *sg_name=get_song_name(cur);
 			if(!sg_name) { 
@@ -466,6 +525,8 @@ static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	(void)offset;
 	(void)fi;
 	if(strcmp(path, "/")==0) {
+		//We are in the root, so show playlists
+		//And maybe later, searches (TODO)
 		filler(buf, ".", NULL, 0);
 		filler(buf, "..", NULL, 0);
 		char **playlists=get_playlists();
@@ -475,7 +536,7 @@ static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		for(i=0;playlists[i];++i) {
 			struct stat stbuf;
 			stbuf.st_mode=S_IFDIR|0755;
-			stbuf.st_nlink=2;
+			stbuf.st_nlink=2;//Every folder has 2 links: himself in his parent, and . in himself
 
 			filler(buf, playlists[i], &stbuf, 0);
 			free(playlists[i]);
@@ -510,9 +571,9 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset,
 	char *pl=path2+1;
 	filename[0]=0;
 	filename++;
-	auto void filler() {
-	}
-	//For access without readdir
+	
+	//Fill the songs cache for this playlist
+	//Usefull only if file accessed directly without folder listing
 	for(j=0;pls[j].name;++j)
 		if(strncmp(pls[j].name, pl ,34)==0)
 			fillin_sgs(pls[j].id);
@@ -566,31 +627,44 @@ static int fs_getattr(const char *path, struct stat *stbuf) {
 		}
 		free(playlists);
 		if(got==0)
+			//The node asked isn't a playlist
+			//So it doesn't exist.
 			return -ENOENT;
 		else {
+			//It is a playlist
+			//So it does exist.
 			stbuf->st_mode=S_IFDIR|0755;
 			stbuf->st_nlink=2;
 			return 0;
 		}
 	} else {
+		//We are in a folder
 		int j;
 		char *path2=strdup(path);
 		char *filename=index(path2+1, '/');
 		char *pl=path2+1;
 		filename[0]=0;
 		filename++;
+		if(index(filename, '/'))
+			//We are in a sub-folder... It shouldn't happen.
+			return -ENOENT;
 		for(j=0;pls[j].name;++j)
 			if(strncmp(pls[j].name, pl ,34)==0)
 				fillin_sgs(pls[j].id);
 		if(!sgs) {
+			//After filling song cache there is no song...
+			//Just give up
 			free(path2);
 			return -ENOENT;
+			//Maybe exit()?
 		}
 		for(j=0;sgs[j].name;++j) {
 			if(strcmp(sgs[j].name, filename)==0) {
+				//Name matches
 				int i;
 				for(i=0;pls[i].name;++i) {
 					if(strcmp(pls[i].name, pl)==0) {
+						//And playlist name too !
 						stbuf->st_mode=S_IFREG|0666;
 						stbuf->st_nlink=1;
 						stbuf->st_size=sgs[j].size;
@@ -610,10 +684,6 @@ static struct fuse_operations fs_oper;
 
 int main(int argc, char **argv) {
 	char *user=getenv("DESPOT_USER");
-	if(!user) {
-		fprintf(stderr, "gimme an user !\n");
-		return -1;
-	}
 	char *pass=getenv("DESPOT_PASS");
 
 	if(init(NULL, NULL, user, pass)) {
