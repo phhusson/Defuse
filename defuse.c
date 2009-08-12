@@ -35,6 +35,7 @@ void write2(int fd, const char *str) {
 #define BUF_SZ 256*1024 
 
 static int fd;
+pthread_mutex_t fd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 //Warning: The id/key's sizes are currently fixed
 //but despotify's documentation says it may change.
@@ -54,10 +55,11 @@ typedef struct {
 	long long int size;
 	ezxml_t tree;
 	int end;
+	pthread_mutex_t mutex;
 } SONG;
 SONG *sgs;
 int sg_pos;
-pthread_mutex_t sgs = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t sgs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 //SETTING
 //Force to use only 160kbps files
@@ -183,11 +185,19 @@ int init(const char *host, const char *port, const char *user, const char *pass)
 	char *cmd=NULL;
 
 	asprintf(&cmd, "login %s %s\n", user, pass);
-	write2(fd, cmd);
-	free(cmd);
-
 	int ln;
-	free(get_answer(&ln));
+	char *ret;
+
+	//Should be useless here
+	pthread_mutex_lock(&fd_mutex);
+	{
+		write2(fd, cmd);
+		ret=get_answer(&ln);
+	}
+	pthread_mutex_unlock(&fd_mutex);
+
+	free(cmd);
+	free(ret);
 	assert(ln==0);
 	return 0;
 }
@@ -196,20 +206,29 @@ int init(const char *host, const char *port, const char *user, const char *pass)
 //the force flag will redownload it even if it has already been donwloaded
 //Should be useless most time,
 //But still you should do some rm -Rf CACHE_PATH/songs/ for the 320kbps migration
+//Or see the appropriate setting
+pthread_mutex_t cache_tracks_mutex = PTHREAD_MUTEX_INITIALIZER;
 void fill_track(const char *id, int force) {
 	char *filename;
 	int r;
 	asprintf(&filename, CACHE_PATH "/songs/%s.xml", id);
+	//We should set a lock on a per file basis
+	//But it's not easy to code, so do it globally
+	pthread_mutex_lock(&cache_tracks_mutex);
 	if(force || (r=access(filename, R_OK))!=0) {
 
 		if(!id)
 			return;
-		char *cmd;
+		char *cmd,*ret;
 		asprintf(&cmd, "browsetrack %s\n", id);
-		write2(fd, cmd);
+		pthread_mutex_lock(&fd_mutex);
+		{
+			write2(fd, cmd);
+			ret=get_answer(&r);
+		}
+		pthread_mutex_unlock(&fd_mutex);
+
 		free(cmd);cmd=NULL;
-		
-		char *ret=get_answer(&r);
 		if(force) {
 			unlink(filename);
 			errno=0;
@@ -218,7 +237,26 @@ void fill_track(const char *id, int force) {
 		write(f, ret, r);
 		free(ret);
 	}
+	pthread_mutex_unlock(&cache_tracks_mutex);
 	free(filename);
+}
+
+//Return an ezxml tree of the song
+ezxml_t get_track(const char *id) {
+	//SETTING:
+	//You may set 1 here (force flag of fill_track), so you won't have any delay with the 320kbps migration
+	//But sometimes this takes a lot of time (or 500 GW error)
+	fill_track(id, 0);
+	char *filename;
+	asprintf(&filename, CACHE_PATH "/songs/%s.xml", id);
+	pthread_mutex_lock(&cache_tracks_mutex);
+	ezxml_t tree;
+	{
+		tree=ezxml_parse_file(filename);
+	}
+	pthread_mutex_unlock(&cache_tracks_mutex);
+	free(filename);
+	return tree;
 }
 
 //Download xml description file of the playlist
@@ -226,20 +264,27 @@ void fill_track(const char *id, int force) {
 //Also for 0^34 ("playlist" of playlists)
 //You should force update at every update of the playlist...
 //For little playlists you can force it everytime, but for big ones you'd better not
+pthread_mutex_t cache_pl_mutex = PTHREAD_MUTEX_INITIALIZER;
 void fill_pl(const char *id, int force) {
 	char *filename;
 	int r;
+	if(!id)
+		return;
 	asprintf(&filename, CACHE_PATH "/playlists/%s.xml", id);
+	//We should set a lock on a per file basis
+	//But it's not easy to code, so do it globally
+	pthread_mutex_lock(&cache_pl_mutex);
 	if(force || (r=access(filename, R_OK))!=0) {
 
-		if(!id)
-			return;
-		char *cmd;
+		char *cmd,*ret;
 		asprintf(&cmd, "playlist %s\n", id);
-		write2(fd, cmd);
+		pthread_mutex_lock(&fd_mutex);
+		{
+			write2(fd, cmd);
+			ret=get_answer(&r);
+		}
+		pthread_mutex_unlock(&fd_mutex);
 		free(cmd);cmd=NULL;
-		
-		char *ret=get_answer(&r);
 		if(force) {
 			unlink(filename);
 			errno=0;
@@ -248,6 +293,7 @@ void fill_pl(const char *id, int force) {
 		write(f, ret, r);
 		free(ret);
 	}
+	pthread_mutex_unlock(&cache_pl_mutex);
 	free(filename);
 }
 
@@ -261,32 +307,28 @@ ezxml_t get_pl(const char *id) {
 	fill_pl(id, 0);
 	char *filename;
 	asprintf(&filename, CACHE_PATH "/playlists/%s.xml", id);
-	ezxml_t tree=ezxml_parse_file(filename);
-	free(filename);
-	return tree;
-}
-
-//Return an ezxml tree of the song
-ezxml_t get_track(const char *id) {
-	//SETTING:
-	//You may set 1 here (force flag of fill_track), so you won't have any delay with the 320kbps migration
-	//But sometimes this takes a lot of time (or 500 GW error)
-	fill_track(id, 0);
-	char *filename;
-	asprintf(&filename, CACHE_PATH "/songs/%s.xml", id);
-	ezxml_t tree=ezxml_parse_file(filename);
+	ezxml_t tree;
+	pthread_mutex_lock(&cache_pl_mutex);
+	{
+		tree=ezxml_parse_file(filename);
+	}
+	pthread_mutex_unlock(&cache_pl_mutex);
 	free(filename);
 	return tree;
 }
 
 //Return the key for a song/file pair
 char *get_key(char *sg_id, char *fileid) {
-	char *cmd;
-	asprintf(&cmd, "key %s %s\n", fileid, sg_id);
-	write2(fd, cmd);
-	free(cmd);
+	char *cmd,*answer;
 	int ln=0;
-	char *answer=get_answer(&ln);
+	asprintf(&cmd, "key %s %s\n", fileid, sg_id);
+	pthread_mutex_lock(&fd_mutex);
+	{
+		write2(fd, cmd);
+		answer=get_answer(&ln);
+	}
+	pthread_mutex_unlock(&fd_mutex);
+	free(cmd);
 #ifndef NDEBUG
 	fprintf(stderr, "Got key !\n");
 #endif
@@ -317,7 +359,7 @@ char *get_key(char *sg_id, char *fileid) {
 char *get_playlist_name(const char *id) {
 	ezxml_t tree=get_pl(id);
 	//The XML Tree isn't explicit at all...
-	//Look at CACHE_PATH/playlists/*.xml
+	//Look at CACHE_PATH/playlists/*.xml if you want to check/understand this
 	char *ret=strdup(ezxml_txt(ezxml_get(tree, "next-change", 0, "change", 0, "ops", 0, "name", -1)));
 	ezxml_free(tree);
 	return ret;
@@ -351,18 +393,25 @@ int get_substream(SONG *sg, long long int offset, int length, char *buf) {
 	//Caching fileid key
 	//TODO: Is the key constant for a file ?
 	//Else we will have to manage that problem (only one global key which will be destroyed at every file change?)
+	pthread_mutex_lock(&(sg->mutex));
 	if(sg->key[0]==0) {
 		char *key=get_key(sg->pl_id, fileid);
 		strncpy(sg->key, key, 33);
 		free(key);
 		sg->key[32]=0;
 	}
+	pthread_mutex_unlock(&(sg->mutex));
 
 	char *cmd;
+	int ret;
 	asprintf(&cmd, "substream %s %lld %d %s\n", fileid, offset, length, sg->key);
-	write2(fd, cmd);
+	pthread_mutex_lock(&fd_mutex);
+	{
+		write2(fd, cmd);
+		ret=get_answer2(buf, length);
+	}
+	pthread_mutex_unlock(&fd_mutex);
 	free(cmd);
-	int ret=get_answer2(buf, length);
 	if(offset==0) {
 		//Please note that this 167 hack is needed but still not undertstood:
 		//There is some Ogg-alike garbage at the start of the stream
@@ -472,12 +521,14 @@ void fillin_sgs(char *plid) {
 		return;
 	}
 	int j;
+	pthread_mutex_lock(&sgs_mutex);
 	//First check it has been filled
 	if(sgs)
 		for(j=0;sgs[j].name;++j)
 			if(strncmp(sgs[j].pl_id, plid, 34)==0) {
 				//Found one song in our playlist, assume it has been filled.
 				ezxml_free(tree);
+				pthread_mutex_unlock(&sgs_mutex);
 				return;
 			}
 	while(items && items[0]) {
@@ -496,6 +547,7 @@ void fillin_sgs(char *plid) {
 		cur.tree=sg_tree;
 		cur.size=get_song_length(cur);
 		cur.end=1000*1000*1000;//A song of 1GB should be fair enough.
+		pthread_mutex_init(&(cur.mutex), 0);
 		{
 			char *sg_name=get_song_name(cur);
 			if(!sg_name) { 
@@ -516,6 +568,7 @@ void fillin_sgs(char *plid) {
 	}
 	sgs[sg_pos].name=NULL;
 	ezxml_free(tree);
+	pthread_mutex_unlock(&sgs_mutex);
 }
 
 
@@ -552,10 +605,12 @@ static int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 				filler(buf, "..", NULL, 0);
 				fillin_sgs(pls[i].id);
 				int j;
+				pthread_mutex_lock(&sgs_mutex);
 				if(sgs)
 					for(j=0;sgs[j].name;++j)
 						if(strncmp(sgs[j].pl_id, pls[i].id, 34)==0)
 							filler(buf, sgs[j].name, NULL, 0);
+				pthread_mutex_unlock(&sgs_mutex);
 
 				return 0;
 			}
@@ -583,6 +638,7 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset,
 	}
 	SONG *cur;
 	cur=NULL;
+	pthread_mutex_lock(&sgs_mutex);
 	for(j=0;sgs[j].name;++j) {
 		if(strcmp(sgs[j].name, filename)==0) {
 			int i;
@@ -594,6 +650,7 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset,
 			}
 		}
 	}
+	pthread_mutex_unlock(&sgs_mutex);
 	free(path2);
 	if(cur==NULL) 
 		return -ENOENT;
@@ -648,9 +705,11 @@ static int fs_getattr(const char *path, struct stat *stbuf) {
 		if(index(filename, '/'))
 			//We are in a sub-folder... It shouldn't happen.
 			return -ENOENT;
+		pthread_mutex_lock(&pls_mutex);
 		for(j=0;pls[j].name;++j)
 			if(strncmp(pls[j].name, pl ,34)==0)
 				fillin_sgs(pls[j].id);
+		pthread_mutex_unlock(&pls_mutex);
 		if(!sgs) {
 			//After filling song cache there is no song...
 			//Just give up
@@ -658,10 +717,12 @@ static int fs_getattr(const char *path, struct stat *stbuf) {
 			return -ENOENT;
 			//Maybe exit()?
 		}
+		pthread_mutex_lock(&sgs_mutex);
 		for(j=0;sgs[j].name;++j) {
 			if(strcmp(sgs[j].name, filename)==0) {
 				//Name matches
 				int i;
+				pthread_mutex_lock(&pls_mutex);
 				for(i=0;pls[i].name;++i) {
 					if(strcmp(pls[i].name, pl)==0) {
 						//And playlist name too !
@@ -669,11 +730,15 @@ static int fs_getattr(const char *path, struct stat *stbuf) {
 						stbuf->st_nlink=1;
 						stbuf->st_size=sgs[j].size;
 						free(path2);
+						pthread_mutex_unlock(&pls_mutex);
+						pthread_mutex_unlock(&sgs_mutex);
 						return 0;
 					}
 				}
+				pthread_mutex_unlock(&pls_mutex);
 			}
 		}
+		pthread_mutex_unlock(&sgs_mutex);
 		free(path2);
 		return -ENOENT;
 	}
