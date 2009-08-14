@@ -5,6 +5,12 @@
  * Search for the SETTING string to know what's tunnable
  * Please note that this works only single threaded, so add -s flag when running.
  */
+/*
+ * Known bugs:
+ * If the file size approximation is too bad, mplayer won't read the file
+ * Workaround: read the end of the file to detect the correct(+/-167B) file size
+ * Or "backup" the folder with cp (or other "simple" tool)
+ */
 #define _GNU_SOURCE
 #define FUSE_USE_VERSION 26
 //SETTING:Uncomment this to drop asserts and log messages
@@ -27,7 +33,11 @@
 #include <pthread.h>
 #include "ezxml.h"
 
+char *last_cmd=NULL;
 void write2(int fd, const char *str) {
+	if(last_cmd)
+		free(last_cmd);
+	last_cmd=strdup(str);
 	write(fd, str, strlen(str));
 }
 #define CACHE_PATH "/tmp/despotify-cache"
@@ -77,7 +87,10 @@ char *get_answer(int *ln) {
 	*ln=tot2;
 	if(ret!=200) {
 		fprintf(stderr, "Spotify GW ERROR: %s\n", buffer);
-		exit(1);
+		printf("Command was '%s'\n", last_cmd);
+		//Q&D hack to get things work.
+		*ln=0;
+		return strdup("");
 	}
 	char *pos=index(buffer, '\n');
 	if(pos) {
@@ -107,7 +120,8 @@ int get_answer2(char *buf, int ln) {
 	sscanf(buffer, "%d %d %255s\n", &ret, &tot2, msg);
 	if(ret!=200) {
 		fprintf(stderr, "Spotify GW ERROR: %s\n", buffer);
-		exit(1);
+		printf("Command was '%s'\n", last_cmd);
+		return 0;
 	}
 
 	if(tot2>ln)
@@ -378,6 +392,9 @@ char *get_song_name(SONG sg) {
 }
 
 int get_substream(SONG *sg, long long int offset, int length, char *buf) {
+	if(offset>sg->end) {
+		return -EINVAL;
+	}
 	//TODO Cache !
 	//But needs sparse files, and can't find any easy way to do it
 	ezxml_t file=ezxml_get(sg->tree, "tracks", 0, "track", 0, "files", 0, "file", !only_160, "");
@@ -412,6 +429,10 @@ int get_substream(SONG *sg, long long int offset, int length, char *buf) {
 	}
 	pthread_mutex_unlock(&fd_mutex);
 	free(cmd);
+	if(ret<length) {
+		sg->end=offset+ret;
+		memset(buf+ret+1, 0, length-ret-1);
+	}
 	if(offset==0) {
 		//Please note that this 167 hack is needed but still not undertstood:
 		//There is some Ogg-alike garbage at the start of the stream
@@ -436,13 +457,20 @@ long long int get_song_length(SONG sg) {
 		approx=320000/(8*1000)*atoi(ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "length", -1)));
 	else
 		approx=160000/(8*1000)*atoi(ezxml_txt(ezxml_get(sg.tree, "tracks", 0, "track", 0, "length", -1)));
-	//Here's a better way to do it, but wwwaaaaaaaayyyyyyy slower.
+	
+	//SETTING
+	approx+=approx/20;//Add 5percents, can cause bugs
+
+	//Here's a better way to do it, but wwwaaaaaaaayyyyyyy(?) slower.
 	//Maybe BUF_SZ doesn't really fits the role
-	/*
-	int start=approx-BUF_SZ/2;
-	int size=get_substream(sg, start, BUF_SZ, NULL)+start;
+	//untested SETTING
+#if 0
+	int start=approx-1024*1024*4;
+	char *buffer=malloc(1024*1024*8);
+	int size=get_substream(&sg, start, BUF_SZ*8, buffer)+start;
+	free(buffer);
 	return size;
-	*/
+#endif
 	return approx;
 }
 
@@ -654,15 +682,9 @@ static int fs_read(const char *path, char *buf, size_t size, off_t offset,
 	free(path2);
 	if(cur==NULL) 
 		return -ENOENT;
-	if(offset>cur->end ) {
-		memset(buf, 0, size);
-		return size;
-	}
 
 	int ret=get_substream(cur, offset, size, buf);
-	if(ret<size && offset!=0)
-		cur->end=offset+ret;
-	return get_substream(cur, offset, size, buf);
+	return ret;
 }
 
 static int fs_getattr(const char *path, struct stat *stbuf) {
@@ -717,28 +739,35 @@ static int fs_getattr(const char *path, struct stat *stbuf) {
 			return -ENOENT;
 			//Maybe exit()?
 		}
-		pthread_mutex_lock(&sgs_mutex);
-		for(j=0;sgs[j].name;++j) {
-			if(strcmp(sgs[j].name, filename)==0) {
+
+		pthread_mutex_lock(&pls_mutex);
+		for(j=0;pls[j].name;++j) {
+			if(strcmp(pls[j].name, pl)==0) {
 				//Name matches
 				int i;
-				pthread_mutex_lock(&pls_mutex);
-				for(i=0;pls[i].name;++i) {
-					if(strcmp(pls[i].name, pl)==0) {
+				pthread_mutex_lock(&sgs_mutex);
+				for(i=0;sgs[i].name;++i) {
+					if(strcmp(sgs[i].name, filename)==0) {
 						//And playlist name too !
 						stbuf->st_mode=S_IFREG|0666;
 						stbuf->st_nlink=1;
-						stbuf->st_size=sgs[j].size;
+						stbuf->st_blksize=4096;//block size of the (future) sparse files
+						if(sgs[i].end!=1000*1000*1000) {
+							stbuf->st_size=sgs[i].end;
+						} else {
+							stbuf->st_size=sgs[i].size;
+						}
+						stbuf->st_blocks=stbuf->st_size/stbuf->st_blksize;
 						free(path2);
-						pthread_mutex_unlock(&pls_mutex);
 						pthread_mutex_unlock(&sgs_mutex);
+						pthread_mutex_unlock(&pls_mutex);
 						return 0;
 					}
 				}
-				pthread_mutex_unlock(&pls_mutex);
+				pthread_mutex_unlock(&sgs_mutex);
 			}
 		}
-		pthread_mutex_unlock(&sgs_mutex);
+		pthread_mutex_unlock(&pls_mutex);
 		free(path2);
 		return -ENOENT;
 	}
